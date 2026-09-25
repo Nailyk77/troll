@@ -62,6 +62,8 @@
 <div class="theme-row"><span class="theme-label">Couleur d&rsquo;ambiance</span><div class="theme-buttons" role="group" aria-label="Couleur d'ambiance"><button class="theme-button" data-theme="apricot" aria-pressed="true" aria-label="Abricot" title="Abricot">&#10003;</button><button class="theme-button" data-theme="berry" aria-pressed="false" aria-label="Myrtille" title="Myrtille"></button><button class="theme-button" data-theme="mint" aria-pressed="false" aria-label="Menthe" title="Menthe"></button></div></div>
 <button id="launch" class="launch">Lancer la blague <span aria-hidden="true">&#8599;</span></button>
 <label class="checkbox-row"><input id="fullscreen" type="checkbox" checked> Demander le plein &eacute;cran au lancement</label>
+<label class="checkbox-row"><input id="multiscreen" type="checkbox" checked> Dupliquer automatiquement sur tous les &eacute;crans d&eacute;tect&eacute;s</label>
+<p class="hint">Mode multi-&eacute;cran : fonctionne surtout avec Chrome / Edge. Au premier lancement, autorise la gestion des fen&ecirc;tres. Si tu as 3 &eacute;crans ou plus, autorise aussi les pop-ups pour ce fichier/site.</p>
 <button id="export-person" class="export-button">Exporter la blague de ce profil &darr;</button>
 <p class="hint">Un fichier HTML autonome, avec sa photo. &Agrave; ouvrir sur un autre poste dans le cadre convenu avec l&rsquo;&eacute;quipe.</p>
 <details class="storage"><summary>Conserver et transporter mes profils</summary><div class="storage-actions"><button id="save" class="small-button">Sauvegarder ici</button><button id="export-studio" class="small-button">Exporter tout l&rsquo;atelier</button></div><button id="clear-storage" class="text-button">Effacer la sauvegarde de ce navigateur</button><p class="hint">Sans sauvegarde, les modifications restent seulement en m&eacute;moire. L&rsquo;atelier export&eacute; contient tous les profils et toutes leurs photos : garde-le en interne.</p></details>
@@ -91,6 +93,7 @@
   let paused = false, ownsFullscreen = false, toastTimer;
   let workspaceId = 'original', storageKey = KEY + ':original';
   let photoJobs = 0;
+  let auxWindows = [], auxBlobUrls = [];
   const scenes = [];
   const uid = () => globalThis.crypto?.randomUUID?.() || 'p-' + Date.now() + '-' + Math.random().toString(36).slice(2);
   const text = (value, limit, fallback = '') => typeof value === 'string' ? value.slice(0, limit) : fallback;
@@ -190,6 +193,92 @@
     $('stage-pause').textContent = paused ? 'Reprendre animations' : 'Pause animations';
     for (const id of ['preview-pause', 'stage-pause']) $(id).setAttribute('aria-pressed', String(paused));
   }
+  function closeAuxWindows() {
+    for (const ref of auxWindows) {
+      try { if (ref && !ref.closed) ref.close(); } catch (_) {}
+    }
+    auxWindows = [];
+    for (const url of auxBlobUrls) {
+      try { URL.revokeObjectURL(url); } catch (_) {}
+    }
+    auxBlobUrls = [];
+  }
+  function makePrankBlobUrl() {
+    const data = {...packageData('prank', true), workspaceId: uid()};
+    const doc = pristine.cloneNode(true);
+    doc.querySelector('#embedded-data').textContent = JSON.stringify(data).replace(/</g, '\\u003c');
+    const html = '<!doctype html>\n' + doc.outerHTML;
+    const url = URL.createObjectURL(new Blob([html], {type: 'text/html;charset=utf-8'}));
+    auxBlobUrls.push(url);
+    return url;
+  }
+  async function startAcrossScreens(fullscreen = false) {
+    const wantsMulti = !!$('multiscreen')?.checked;
+    if (!wantsMulti || !('getScreenDetails' in window)) {
+      start(fullscreen);
+      return;
+    }
+
+    let details;
+    try {
+      details = await window.getScreenDetails();
+    } catch (_) {
+      start(fullscreen);
+      notify('Le navigateur n\u2019a pas autoris\u00e9 le mode multi-\u00e9cran. La blague reste sur cet \u00e9cran.');
+      return;
+    }
+
+    closeAuxWindows();
+    const prankUrl = makePrankBlobUrl();
+    const currentScreen = details.currentScreen;
+    let opened = 0;
+    let blocked = 0;
+
+    for (let index = 0; index < details.screens.length; index++) {
+      const screenInfo = details.screens[index];
+      if (screenInfo === currentScreen) continue;
+      const left = Math.round(screenInfo.availLeft);
+      const top = Math.round(screenInfo.availTop);
+      const width = Math.max(300, Math.round(screenInfo.availWidth));
+      const height = Math.max(240, Math.round(screenInfo.availHeight));
+      const features = `popup=yes,left=${left},top=${top},width=${width},height=${height},fullscreen=yes`;
+      let ref = null;
+      try {
+        ref = window.open(prankUrl, `croissant-screen-${index}-${workspaceId}`, features);
+      } catch (_) {}
+      if (!ref) {
+        blocked++;
+        continue;
+      }
+      opened++;
+      auxWindows.push(ref);
+      // Re-apply placement after load because some Chromium builds adjust the initial bounds.
+      setTimeout(() => {
+        try {
+          if (!ref.closed) {
+            ref.moveTo(left, top);
+            ref.resizeTo(width, height);
+          }
+        } catch (_) {}
+      }, 450);
+    }
+
+    // The current browser window becomes the prank on its own display.
+    start(false);
+    if (fullscreen) {
+      try {
+        await document.documentElement.requestFullscreen({screen: currentScreen, navigationUI: 'hide'});
+        if (playing) ownsFullscreen = true;
+      } catch (_) {
+        // A popup may have consumed the transient user activation. This fallback is intentionally silent.
+        try { await document.documentElement.requestFullscreen({navigationUI: 'hide'}); if (playing) ownsFullscreen = true; } catch (_) {}
+      }
+    }
+
+    if (blocked) {
+      notify(`Multi-\u00e9cran partiel : ${opened + 1}/${details.screens.length} \u00e9cran(s) ouverts. Autorise les pop-ups pour utiliser les autres.`);
+    }
+  }
   async function enterFullscreen() {
     if (!playing || document.fullscreenElement) return;
     if (!document.documentElement.requestFullscreen) {
@@ -210,6 +299,10 @@
   }
   function finish() {
     if (!playing) return;
+    if (window.opener && window.opener !== window) {
+      try { window.opener.postMessage({type: 'croissant-exit-all'}, '*'); } catch (_) {}
+    }
+    closeAuxWindows();
     playing = false; ownsFullscreen = false; document.body.classList.remove('mode-play');
     $('prank-view').hidden = true;
     if (kind === 'prank') { $('finish-view').hidden = false; $('replay').focus(); }
@@ -282,7 +375,7 @@
     finally { photoJobs--; $('photo').value = ''; }
   });
   $('remove-photo').addEventListener('click', () => { const p = current(); p._photoVersion = (p._photoVersion || 0) + 1; p.photo = ''; updatePreview(); changed(); });
-  $('launch').addEventListener('click', () => start($('fullscreen').checked));
+  $('launch').addEventListener('click', () => void startAcrossScreens($('fullscreen').checked));
   $('exit').addEventListener('click', finish);
   $('enter-fullscreen').addEventListener('click', () => void enterFullscreen());
   $('replay').addEventListener('click', () => start(false));
@@ -310,6 +403,13 @@
     try { localStorage.removeItem(storageKey); $('storage-status').textContent = 'Sauvegarde effac\u00e9e. Les profils affich\u00e9s restent en m\u00e9moire jusqu\u2019\u00e0 la fermeture.'; notify('Sauvegarde du navigateur effac\u00e9e. Les fichiers export\u00e9s ne sont pas supprim\u00e9s.'); }
     catch (_) { notify('Le navigateur ne donne pas acc\u00e8s \u00e0 la sauvegarde locale.'); }
   });
+
+  window.addEventListener('message', event => {
+    if (event?.data?.type !== 'croissant-exit-all') return;
+    closeAuxWindows();
+    if (playing) finish();
+  });
+  window.addEventListener('beforeunload', closeAuxWindows);
 
   function init() {
     let data;
